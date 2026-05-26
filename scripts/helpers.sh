@@ -65,6 +65,16 @@ capture_pane_contents_option_on() {
 }
 
 files_differ() {
+	# cmp exits 0 (identical), 1 (different), or 2 (error — usually a missing
+	# or unreadable target, including a broken symlink). The old `! cmp` form
+	# treated exit-2 as "differ" only by accident, but a parallel bug in
+	# save_all (writing without atomic-rename) could pair with this to leave
+	# `last` permanently pointing at a deleted file.
+	# Guard explicitly: if the target can't be read, treat as differ so the
+	# caller updates `last` to point at the new save.
+	if [ ! -r "$2" ]; then
+		return 0
+	fi
 	! cmp -s "$1" "$2"
 }
 

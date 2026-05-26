@@ -226,27 +226,74 @@ dump_pane_contents() {
 		done
 }
 
+# A save file is valid if it exists, is non-empty, and contains at least one
+# `window<TAB>` line — the minimal structural element resurrect needs to
+# restore. A partial/failed dump (tmux server hiccup, signal mid-write, OOM)
+# typically produces an empty file or one with only session lines.
+save_file_is_valid() {
+	local path="$1"
+	[ -s "$path" ] && grep -q $'^window\t' "$path"
+}
+
 remove_old_backups() {
 	# remove resurrect files older than 30 days (default), but keep at least 5 copies of backup.
 	local delete_after="$(get_tmux_option "$delete_backup_after_option" "$default_delete_backup_after")"
 	local -a files
 	files=($(ls -t $(resurrect_dir)/${RESURRECT_FILE_PREFIX}_*.${RESURRECT_FILE_EXTENSION} | tail -n +6))
-	[[ ${#files[@]} -eq 0 ]] ||
-		find "${files[@]}" -type f -mtime "+${delete_after}" -exec rm -v "{}" \; > /dev/null
+	[[ ${#files[@]} -eq 0 ]] && return
+
+	# Never delete the file currently pointed at by `last`, even if it falls
+	# outside the 5 most-recent-by-mtime window. Otherwise a long-quiet system
+	# whose `last` is older than 30 days would lose its only restorable save
+	# and `last` would dangle.
+	local last_link="$(resurrect_dir)/last"
+	local last_target=""
+	if [ -L "$last_link" ]; then
+		last_target="$(resurrect_dir)/$(readlink "$last_link")"
+	fi
+
+	local -a deletable=()
+	local f
+	for f in "${files[@]}"; do
+		[[ "$f" == "$last_target" ]] && continue
+		deletable+=("$f")
+	done
+	[[ ${#deletable[@]} -eq 0 ]] && return
+	find "${deletable[@]}" -type f -mtime "+${delete_after}" -exec rm -v "{}" \; > /dev/null
 }
 
 save_all() {
 	local resurrect_file_path="$(resurrect_file_path)"
 	local last_resurrect_file="$(last_resurrect_file)"
+	local tmp_path="${resurrect_file_path}.tmp"
 	mkdir -p "$(resurrect_dir)"
-	fetch_and_dump_grouped_sessions > "$resurrect_file_path"
-	dump_panes   >> "$resurrect_file_path"
-	dump_windows >> "$resurrect_file_path"
-	dump_state   >> "$resurrect_file_path"
-	execute_hook "post-save-layout" "$resurrect_file_path"
+
+	# Write the new save to a temp path so a partial/failed write can never
+	# replace the previous-good save. We only promote (rename) once the temp
+	# file passes basic validation.
+	fetch_and_dump_grouped_sessions > "$tmp_path"
+	dump_panes   >> "$tmp_path"
+	dump_windows >> "$tmp_path"
+	dump_state   >> "$tmp_path"
+	execute_hook "post-save-layout" "$tmp_path"
+
+	if ! save_file_is_valid "$tmp_path"; then
+		echo "tmux-resurrect: save aborted — generated file failed validation ($tmp_path); previous save preserved" >&2
+		rm -f "$tmp_path"
+		return 1
+	fi
+
+	# Atomic promotion: rename temp → final. After this point the new file
+	# definitely exists with validated content, so the symlink update below
+	# can never end up pointing at a missing target.
+	mv -f "$tmp_path" "$resurrect_file_path"
+
 	if files_differ "$resurrect_file_path" "$last_resurrect_file"; then
 		ln -fs "$(basename "$resurrect_file_path")" "$last_resurrect_file"
 	else
+		# Identical to last save — drop the redundant new file and keep the
+		# existing `last` target. Safe now because files_differ guards
+		# against an unreadable target (broken symlink).
 		rm "$resurrect_file_path"
 	fi
 	if capture_pane_contents_option_on; then
