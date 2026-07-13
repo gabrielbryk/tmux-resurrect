@@ -131,6 +131,12 @@ last_resurrect_file() {
 	echo "$(resurrect_dir)/last"
 }
 
+companion_file_path() {
+	local layout_path="$1"
+	local suffix="$(get_tmux_option "$companion_suffix_option" "")"
+	[ -n "$suffix" ] && printf '%s%s\n' "${layout_path%.*}" "$suffix"
+}
+
 pane_contents_dir() {
 	echo "$(resurrect_dir)/$1/pane_contents/"
 }
@@ -165,5 +171,7 @@ execute_hook() {
 
 	if [ -n "$hook" ]; then
 		eval "$hook $args"
+		return $?
 	fi
+	return 0
 }

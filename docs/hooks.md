@@ -9,12 +9,31 @@ Currently the following hooks are supported:
 - `@resurrect-hook-post-save-layout`
 
   Called after all sessions, panes and windows have been saved.
+  Receives the staged layout path as its first argument. A non-zero exit aborts
+  the save and preserves the previous `last` target.
 
   Passed single argument of the state file.
 
 - `@resurrect-hook-post-save-all`
 
   Called at end of save process right before the spinner is turned off.
+
+## Transactional companion files
+
+A post-save hook can require a versioned file to be committed with each tmux
+layout:
+
+```tmux
+set -g @resurrect-companion-suffix '.assistants.json'
+set -g @resurrect-hook-post-save-layout '/path/to/save-companion.sh'
+```
+
+For staged layout `tmux_resurrect_20260712T120000.txt.tmp`, the hook must return
+success after atomically creating the non-empty companion
+`tmux_resurrect_20260712T120000.assistants.json`. Resurrect validates both files
+before atomically moving `last` to the new layout. A failed hook, empty
+companion, invalid layout, or failed pane archive leaves the previous pair
+selected. Backup pruning removes the layout and companion together.
 
 - `@resurrect-hook-pre-restore-all`
 

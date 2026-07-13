@@ -259,51 +259,124 @@ remove_old_backups() {
 		deletable+=("$f")
 	done
 	[[ ${#deletable[@]} -eq 0 ]] && return
-	find "${deletable[@]}" -type f -mtime "+${delete_after}" -exec rm -v "{}" \; > /dev/null
+	for f in "${deletable[@]}"; do
+		if find "$f" -type f -mtime "+${delete_after}" -print | grep -q .; then
+			rm -f "$f"
+			local companion="$(companion_file_path "$f")"
+			[ -n "$companion" ] && rm -f "$companion"
+		fi
+	done
+}
+
+log_save_phase() {
+	echo "tmux-resurrect: phase=$1 status=$2${3:+ $3}" >&2
+}
+
+remove_staged_pair() {
+	local layout_tmp="$1" layout_final="$2" companion="$3"
+	rm -f "$layout_tmp" "$layout_final"
+	[ -n "$companion" ] && rm -f "$companion"
+}
+
+update_last_symlink() {
+	local layout="$1" last_link="$2"
+	local staged_link="${last_link}.tmp.$$"
+	rm -f "$staged_link"
+	ln -s "$(basename "$layout")" "$staged_link" || return 1
+	mv -f "$staged_link" "$last_link"
 }
 
 save_all() {
 	local resurrect_file_path="$(resurrect_file_path)"
 	local last_resurrect_file="$(last_resurrect_file)"
 	local tmp_path="${resurrect_file_path}.tmp"
+	local companion_path="$(companion_file_path "$resurrect_file_path")"
 	mkdir -p "$(resurrect_dir)"
 
-	# Write the new save to a temp path so a partial/failed write can never
-	# replace the previous-good save. We only promote (rename) once the temp
-	# file passes basic validation.
-	fetch_and_dump_grouped_sessions > "$tmp_path"
-	dump_panes   >> "$tmp_path"
-	dump_windows >> "$tmp_path"
-	dump_state   >> "$tmp_path"
-	execute_hook "post-save-layout" "$tmp_path"
-
-	if ! save_file_is_valid "$tmp_path"; then
-		echo "tmux-resurrect: save aborted — generated file failed validation ($tmp_path); previous save preserved" >&2
-		rm -f "$tmp_path"
+	# Refuse a same-second filename collision instead of overwriting a pair that
+	# may still be selected by `last`.
+	if [ -n "$companion_path" ] && { [ -e "$resurrect_file_path" ] || [ -e "$companion_path" ]; }; then
+		log_save_phase "layout-dump" "failed" "reason=filename-collision"
 		return 1
 	fi
 
-	# Atomic promotion: rename temp → final. After this point the new file
-	# definitely exists with validated content, so the symlink update below
-	# can never end up pointing at a missing target.
-	mv -f "$tmp_path" "$resurrect_file_path"
+	log_save_phase "layout-dump" "started" "path=$tmp_path"
+	if ! {
+		fetch_and_dump_grouped_sessions > "$tmp_path" &&
+		dump_panes   >> "$tmp_path" &&
+		dump_windows >> "$tmp_path" &&
+		dump_state   >> "$tmp_path"
+	}; then
+		log_save_phase "layout-dump" "failed" "previous-save=preserved"
+		remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+		return 1
+	fi
+	log_save_phase "layout-dump" "complete"
 
-	if files_differ "$resurrect_file_path" "$last_resurrect_file"; then
-		ln -fs "$(basename "$resurrect_file_path")" "$last_resurrect_file"
-	else
-		# Identical to last save — drop the redundant new file and keep the
-		# existing `last` target. Safe now because files_differ guards
-		# against an unreadable target (broken symlink).
-		rm "$resurrect_file_path"
+	log_save_phase "companion" "started"
+	if ! execute_hook "post-save-layout" "$tmp_path"; then
+		log_save_phase "companion" "failed" "previous-save=preserved"
+		remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+		return 1
 	fi
+	if [ -n "$companion_path" ] && [ ! -s "$companion_path" ]; then
+		log_save_phase "companion" "failed" "reason=missing-or-empty path=$companion_path"
+		remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+		return 1
+	fi
+	log_save_phase "companion" "complete" "${companion_path:+path=$companion_path}"
+
+	if ! save_file_is_valid "$tmp_path"; then
+		log_save_phase "validation" "failed" "path=$tmp_path previous-save=preserved"
+		remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+		return 1
+	fi
+	log_save_phase "validation" "complete"
+
+	log_save_phase "promotion" "started"
+	if ! mv -f "$tmp_path" "$resurrect_file_path"; then
+		log_save_phase "promotion" "failed" "previous-save=preserved"
+		remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+		return 1
+	fi
+
 	if capture_pane_contents_option_on; then
+		log_save_phase "pane-archive" "started"
 		mkdir -p "$(pane_contents_dir "save")"
-		dump_pane_contents
-		pane_contents_create_archive
-		rm "$(pane_contents_dir "save")"/*
+		if ! dump_pane_contents || ! pane_contents_create_archive; then
+			log_save_phase "pane-archive" "failed" "previous-save=preserved"
+			remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+			return 1
+		fi
+		rm -f "$(pane_contents_dir "save")"/*
+		log_save_phase "pane-archive" "complete"
 	fi
+
+	# The atomic rename of this symlink is the commit point. A restorer sees
+	# either the previous pair or the fully validated new pair.
+	if [ -n "$companion_path" ]; then
+		if ! update_last_symlink "$resurrect_file_path" "$last_resurrect_file"; then
+			log_save_phase "promotion" "failed" "reason=last-symlink previous-save=preserved"
+			remove_staged_pair "$tmp_path" "$resurrect_file_path" "$companion_path"
+			return 1
+		fi
+	elif files_differ "$resurrect_file_path" "$last_resurrect_file"; then
+		if ! update_last_symlink "$resurrect_file_path" "$last_resurrect_file"; then
+			log_save_phase "promotion" "failed" "reason=last-symlink previous-save=preserved"
+			rm -f "$resurrect_file_path"
+			return 1
+		fi
+	else
+		rm -f "$resurrect_file_path"
+	fi
+	log_save_phase "promotion" "complete" "last=$(readlink "$last_resurrect_file")"
+
 	remove_old_backups
-	execute_hook "post-save-all"
+	if ! execute_hook "post-save-all"; then
+		log_save_phase "finalize" "failed"
+		return 1
+	fi
+	log_save_phase "finalize" "complete"
 }
 
 show_output() {
@@ -315,11 +388,18 @@ main() {
 		if show_output; then
 			start_spinner "Saving..." "Tmux environment saved!"
 		fi
-		save_all
+		local save_status=0
+		save_all || save_status=$?
 		if show_output; then
 			stop_spinner
-			display_message "Tmux environment saved!"
+			if [ "$save_status" -eq 0 ]; then
+				display_message "Tmux environment saved!"
+			else
+				display_message "Tmux environment save failed; previous save preserved"
+			fi
 		fi
+		return "$save_status"
 	fi
+	return 1
 }
 main

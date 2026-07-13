@@ -46,3 +46,8 @@ hook_prefix="@resurrect-hook-"
 
 delete_backup_after_option="@resurrect-delete-backup-after"
 default_delete_backup_after="30" # days
+
+# Optional suffix for a versioned file that must be created by the
+# post-save-layout hook before a layout can be promoted. For example,
+# `.assistants.json` pairs tmux_resurrect_*.txt with assistant metadata.
+companion_suffix_option="@resurrect-companion-suffix"
